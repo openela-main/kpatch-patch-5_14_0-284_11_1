@@ -1,0 +1,530 @@
+From 45adcd26a1a24ac0290a9c5bd62fd1caecd98f6c Mon Sep 17 00:00:00 2001
+From: Josh Poimboeuf <jpoimboe@redhat.com>
+Date: Mon, 21 Nov 2022 19:23:07 -0800
+Subject: [PATCH] v0.9.7 backport: MR!1315 ("Static call fixes")
+Content-type: text/plain
+
+commit 87ad96760a3af0db294d44865dfa1703f57f5595
+Author: Josh Poimboeuf <jpoimboe@redhat.com>
+Date:   Mon Nov 21 19:23:07 2022 -0800
+
+    create-diff-object: fix s390 special_section initializer spacing
+
+    Align the s390 special_section initializers to improve readability and
+    for consistency with the rest.
+
+    Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+
+commit 56bd8c4d0da1634f8549e7269f77a53e9d936a57
+Author: Josh Poimboeuf <jpoimboe@redhat.com>
+Date:   Mon Nov 21 19:27:23 2022 -0800
+
+    create-diff-object: refactor jump label filtering
+
+    Convert the hard-coded should_keep_jump_label() to a proper callback,
+    since static calls will need a similar filter.
+
+    Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+
+commit f83218ad12a2d9e20d99d379c78974a576aa558c
+Author: Josh Poimboeuf <jpoimboe@redhat.com>
+Date:   Mon Nov 21 19:29:53 2022 -0800
+
+    create-diff-object: detect unsupported static calls
+
+    Similar to jump labels, static calls aren't supported when the static
+    call key was originally defined in a module rather than in vmlinux.
+    Detect those cases and either remove them (in the case of tracepoints)
+    or error out.
+
+    Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+
+commit ab2397c03e31f0f697aa8bf943d70b4e5a7def54
+Author: Josh Poimboeuf <jpoimboe@redhat.com>
+Date:   Mon Nov 21 19:41:30 2022 -0800
+
+    kpatch-macros: add KPATCH_STATIC_CALL()
+
+    Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+
+commit 92c178b6a30a827c48db46ff4238501ec406a28e
+Author: Josh Poimboeuf <jpoimboe@redhat.com>
+Date:   Tue Nov 22 12:53:09 2022 -0800
+
+    create-diff-object: use errx() instead of err()
+
+    Otherwise on recent distros it appends the errno to the error message,
+    like:
+
+      create-diff-object: ERROR: x86.o: kpatch_regenerate_special_section: 2633: Found 1 unsupported static call(s) in the patched code. Use KPATCH_STATIC_CALL() instead.: Success
+
+    which is not what we want in most cases.
+
+    Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+
+Signed-off-by: Joe Lawrence <joe.lawrence@redhat.com>
+---
+ kmod/patch/kpatch-macros.h        |  11 +
+ kpatch-build/create-diff-object.c | 328 ++++++++++++++++++------------
+ kpatch-build/log.h                |   2 +-
+ 3 files changed, 211 insertions(+), 130 deletions(-)
+
+diff --git a/kmod/patch/kpatch-macros.h b/kmod/patch/kpatch-macros.h
+index 8e09702ea001..b797838849ca 100644
+--- a/kmod/patch/kpatch-macros.h
++++ b/kmod/patch/kpatch-macros.h
+@@ -141,4 +141,15 @@ struct kpatch_post_unpatch_callback {
+ 		printk(_fmt, ## __VA_ARGS__); \
+ })
+ 
++/*
++ * KPATCH_STATIC_CALL macro
++ *
++ * Replace usages of static_call() with this macro, when create-diff-object
++ * recommends it due to the original static call key living in a module.
++ *
++ * This converts the static call to a regular indirect call.
++ */
++#define KPATCH_STATIC_CALL(name) \
++	((typeof(STATIC_CALL_TRAMP(name))*)(STATIC_CALL_KEY(name).func))
++
+ #endif /* __KPATCH_MACROS_H_ */
+diff --git a/kpatch-build/create-diff-object.c b/kpatch-build/create-diff-object.c
+index 7106b67cfd25..ddaa9b44f11e 100644
+--- a/kpatch-build/create-diff-object.c
++++ b/kpatch-build/create-diff-object.c
+@@ -56,7 +56,7 @@
+ #define DIFF_FATAL(format, ...) \
+ ({ \
+ 	fprintf(stderr, "ERROR: %s: " format "\n", childobj, ##__VA_ARGS__); \
+-	err(EXIT_STATUS_DIFF_FATAL, "unreconcilable difference"); \
++	errx(EXIT_STATUS_DIFF_FATAL, "unreconcilable difference"); \
+ })
+ 
+ char *childobj;
+@@ -71,6 +71,8 @@ enum loglevel loglevel = NORMAL;
+ 
+ bool KLP_ARCH;
+ 
++int jump_label_errors, static_call_errors;
++
+ /*******************
+  * Data structures
+  * ****************/
+@@ -78,6 +80,9 @@ struct special_section {
+ 	char *name;
+ 	enum architecture arch;
+ 	int (*group_size)(struct kpatch_elf *kelf, int offset);
++	bool (*group_filter)(struct lookup_table *lookup,
++			     struct section *relasec, unsigned int offset,
++			     unsigned int size);
+ };
+ 
+ /*************
+@@ -2215,6 +2220,169 @@ static int fixup_group_size(struct kpatch_elf *kelf, int offset)
+ 	return (int)(rela->addend - offset);
+ }
+ 
++static bool jump_table_group_filter(struct lookup_table *lookup,
++				    struct section *relasec,
++				    unsigned int group_offset,
++				    unsigned int group_size)
++{
++	struct rela *code = NULL, *key = NULL, *rela;
++	bool tracepoint = false, dynamic_debug = false;
++	struct lookup_result symbol;
++	int i = 0;
++
++	/*
++	 * Here we hard-code knowledge about the contents of the jump_entry
++	 * struct.  It has three fields: code, target, and key.  Each field has
++	 * a relocation associated with it.
++	 */
++	list_for_each_entry(rela, &relasec->relas, list) {
++		if (rela->offset >= group_offset &&
++		    rela->offset < group_offset + group_size) {
++			if (i == 0)
++				code = rela;
++			else if (i == 2)
++				key = rela;
++			i++;
++		}
++	}
++
++	if (i != 3 || !key || !code)
++		ERROR("BUG: __jump_table has an unexpected format");
++
++	if (!strncmp(key->sym->name, "__tracepoint_", 13))
++		tracepoint = true;
++
++	if (is_dynamic_debug_symbol(key->sym))
++		dynamic_debug = true;
++
++	if (KLP_ARCH) {
++		/*
++		 * On older kernels (with .klp.arch support), jump labels
++		 * aren't supported at all.  Error out when they occur in a
++		 * replacement function, with the exception of tracepoints and
++		 * dynamic debug printks.  An inert tracepoint or printk is
++		 * harmless enough, but a broken jump label can cause
++		 * unexpected behavior.
++		 */
++		if (tracepoint || dynamic_debug)
++			return false;
++
++		/*
++		 * This will be upgraded to an error after all jump labels have
++		 * been reported.
++		 */
++		log_normal("Found a jump label at %s()+0x%lx, using key %s.  Jump labels aren't supported with this kernel.  Use static_key_enabled() instead.\n",
++			   code->sym->name, code->addend, key->sym->name);
++		jump_label_errors++;
++		return false;
++	}
++
++	/*
++	 * On newer (5.8+) kernels, jump labels are supported in the case where
++	 * the corresponding static key lives in vmlinux.  That's because such
++	 * kernels apply vmlinux-specific .klp.rela sections at the same time
++	 * (in the klp module load) as normal relas, before jump label init.
++	 * On the other hand, jump labels based on static keys which are
++	 * defined in modules aren't supported, because late module patching
++	 * can result in the klp relas getting applied *after* the klp module's
++	 * jump label init.
++	 */
++
++	if (lookup_symbol(lookup, key->sym, &symbol) &&
++	    strcmp(symbol.objname, "vmlinux")) {
++
++		/* The static key lives in a module -- not supported */
++
++		/* Inert tracepoints and dynamic debug printks are harmless */
++		if (tracepoint || dynamic_debug)
++			return false;
++
++		/*
++		 * This will be upgraded to an error after all jump label
++		 * errors have been reported.
++		 */
++		log_normal("Found a jump label at %s()+0x%lx, using key %s, which is defined in a module.  Use static_key_enabled() instead.\n",
++			   code->sym->name, code->addend, key->sym->name);
++		jump_label_errors++;
++		return false;
++	}
++
++	/* The static key lives in vmlinux or the patch module itself */
++
++	/*
++	 * If the jump label key lives in the '__dyndbg' section, make sure
++	 * the section gets included, because we don't use klp relocs for
++	 * dynamic debug symbols.  For an example of such a key, see
++	 * DYNAMIC_DEBUG_BRANCH().
++	 */
++	if (dynamic_debug)
++		kpatch_include_symbol(key->sym);
++
++	return true;
++}
++
++static bool static_call_sites_group_filter(struct lookup_table *lookup,
++					   struct section *relasec,
++					   unsigned int group_offset,
++					   unsigned int group_size)
++{
++	struct rela *code = NULL, *key = NULL, *rela;
++	bool tracepoint = false;
++	struct lookup_result symbol;
++	int i = 0;
++
++	/*
++	 * Here we hard-code knowledge about the contents of the jump_entry
++	 * struct.  It has three fields: code, target, and key.  Each field has
++	 * a relocation associated with it.
++	 */
++	list_for_each_entry(rela, &relasec->relas, list) {
++		if (rela->offset >= group_offset &&
++		    rela->offset < group_offset + group_size) {
++			if (i == 0)
++				code = rela;
++			else if (i == 1)
++				key = rela;
++			i++;
++		}
++	}
++
++	if (i != 2 || !key || !code)
++		ERROR("BUG: .static_call_sites has an unexpected format");
++
++	if (!strncmp(key->sym->name, "__SCK__tp_func_", 15))
++		tracepoint = true;
++
++	/*
++	 * Static calls are only supported in the case where the corresponding
++	 * static call key lives in vmlinux (see explanation in
++	 * jump_table_group_filter).
++	 */
++
++	if (lookup_symbol(lookup, key->sym, &symbol) &&
++	    strcmp(symbol.objname, "vmlinux")) {
++
++		/* The key lives in a module -- not supported */
++
++		/* Inert tracepoints are harmless */
++		if (tracepoint)
++			return false;
++
++		/*
++		 * This will be upgraded to an error after all static call
++		 * errors have been reported.
++		 */
++		log_normal("Found a static call at %s()+0x%lx, using key %s, which is defined in a module.  Use KPATCH_STATIC_CALL() instead.\n",
++			   code->sym->name, code->addend, key->sym->name);
++		static_call_errors++;
++		return false;
++	}
++
++	/* The key lives in vmlinux or the patch module itself */
++	return true;
++}
++
++
+ static struct special_section special_sections[] = {
+ 	{
+ 		.name		= "__bug_table",
+@@ -2235,6 +2403,7 @@ static struct special_section special_sections[] = {
+ 		.name		= "__jump_table",
+ 		.arch		= X86_64 | PPC64 | S390,
+ 		.group_size	= jump_table_group_size,
++		.group_filter	= jump_table_group_filter,
+ 	},
+ 	{
+ 		.name		= ".printk_index",
+@@ -2260,6 +2429,7 @@ static struct special_section special_sections[] = {
+ 		.name		= ".static_call_sites",
+ 		.arch		= X86_64,
+ 		.group_size	= static_call_sites_group_size,
++		.group_filter	= static_call_sites_group_filter,
+ 	},
+ 	{
+ 		.name		= ".retpoline_sites",
+@@ -2297,138 +2467,36 @@ static struct special_section special_sections[] = {
+ 		.group_size	= fixup_barrier_nospec_group_size,
+ 	},
+ 	{
+-		.name = ".s390_return_mem",
+-		.arch = S390,
+-		.group_size = s390_expolines_group_size,
++		.name		= ".s390_return_mem",
++		.arch		= S390,
++		.group_size	= s390_expolines_group_size,
+ 	},
+ 	{
+-		.name = ".s390_return_reg",
+-		.arch = S390,
+-		.group_size = s390_expolines_group_size,
++		.name		= ".s390_return_reg",
++		.arch		= S390,
++		.group_size	= s390_expolines_group_size,
+ 	},
+ 	{
+-		.name = ".s390_indirect_call",
+-		.arch = S390,
+-		.group_size = s390_expolines_group_size,
++		.name		= ".s390_indirect_call",
++		.arch		= S390,
++		.group_size	= s390_expolines_group_size,
+ 	},
+ 	{
+-		.name = ".s390_indirect_branches",
+-		.arch = S390,
+-		.group_size = s390_expolines_group_size,
++		.name		= ".s390_indirect_branches",
++		.arch		= S390,
++		.group_size	= s390_expolines_group_size,
+ 	},
+ 	{
+-		.name = ".s390_indirect_jump",
+-		.arch = S390,
+-		.group_size = s390_expolines_group_size,
++		.name		= ".s390_indirect_jump",
++		.arch		= S390,
++		.group_size	= s390_expolines_group_size,
+ 	},
+ 	{},
+ };
+ 
+-static bool should_keep_jump_label(struct lookup_table *lookup,
+-				   struct section *relasec,
+-				   unsigned int group_offset,
+-				   unsigned int group_size,
+-				   int *jump_labels_found)
+-{
+-	struct rela *code = NULL, *key = NULL, *rela;
+-	bool tracepoint = false, dynamic_debug = false;
+-	struct lookup_result symbol;
+-	int i = 0;
+-
+-	/*
+-	 * Here we hard-code knowledge about the contents of the jump_entry
+-	 * struct.  It has three fields: code, target, and key.  Each field has
+-	 * a relocation associated with it.
+-	 */
+-	list_for_each_entry(rela, &relasec->relas, list) {
+-		if (rela->offset >= group_offset &&
+-		    rela->offset < group_offset + group_size) {
+-			if (i == 0)
+-				code = rela;
+-			else if (i == 2)
+-				key = rela;
+-			i++;
+-		}
+-	}
+-
+-	if (i != 3 || !key || !code)
+-		ERROR("BUG: __jump_table has an unexpected format");
+-
+-	if (!strncmp(key->sym->name, "__tracepoint_", 13))
+-		tracepoint = true;
+-
+-	if (is_dynamic_debug_symbol(key->sym))
+-		dynamic_debug = true;
+-
+-	if (KLP_ARCH) {
+-		/*
+-		 * On older kernels (with .klp.arch support), jump labels
+-		 * aren't supported at all.  Error out when they occur in a
+-		 * replacement function, with the exception of tracepoints and
+-		 * dynamic debug printks.  An inert tracepoint or printk is
+-		 * harmless enough, but a broken jump label can cause
+-		 * unexpected behavior.
+-		 */
+-		if (tracepoint || dynamic_debug)
+-			return false;
+-
+-		/*
+-		 * This will be upgraded to an error after all jump labels have
+-		 * been reported.
+-		 */
+-		log_normal("Found a jump label at %s()+0x%lx, using key %s.  Jump labels aren't supported with this kernel.  Use static_key_enabled() instead.\n",
+-			   code->sym->name, code->addend, key->sym->name);
+-		(*jump_labels_found)++;
+-		return false;
+-	}
+-
+-	/*
+-	 * On newer (5.8+) kernels, jump labels are supported in the case where
+-	 * the corresponding static key lives in vmlinux.  That's because such
+-	 * kernels apply vmlinux-specific .klp.rela sections at the same time
+-	 * (in the klp module load) as normal relas, before jump label init.
+-	 * On the other hand, jump labels based on static keys which are
+-	 * defined in modules aren't supported, because late module patching
+-	 * can result in the klp relas getting applied *after* the klp module's
+-	 * jump label init.
+-	 */
+-
+-	if (lookup_symbol(lookup, key->sym, &symbol) &&
+-	    strcmp(symbol.objname, "vmlinux")) {
+-
+-		/* The static key lives in a module -- not supported */
+-
+-		/* Inert tracepoints and dynamic debug printks are harmless */
+-		if (tracepoint || dynamic_debug)
+-			return false;
+-
+-		/*
+-		 * This will be upgraded to an error after all jump labels have
+-		 * been reported.
+-		 */
+-		log_normal("Found a jump label at %s()+0x%lx, using key %s, which is defined in a module.  Use static_key_enabled() instead.\n",
+-			   code->sym->name, code->addend, key->sym->name);
+-		(*jump_labels_found)++;
+-		return false;
+-	}
+-
+-	/* The static key lives in vmlinux or the patch module itself */
+-
+-	/*
+-	 * If the jump label key lives in the '__dyndbg' section, make sure
+-	 * the section gets included, because we don't use klp relocs for
+-	 * dynamic debug symbols.  For an example of such a key, see
+-	 * DYNAMIC_DEBUG_BRANCH().
+-	 */
+-	if (dynamic_debug)
+-		kpatch_include_symbol(key->sym);
+-
+-	return true;
+-}
+-
+ static bool should_keep_rela_group(struct lookup_table *lookup,
+ 				   struct section *relasec, unsigned int offset,
+-				   unsigned int size, int *jump_labels_found)
++				   unsigned int size)
+ {
+ 	struct rela *rela;
+ 	bool found = false;
+@@ -2448,10 +2516,6 @@ static bool should_keep_rela_group(struct lookup_table *lookup,
+ 	if (!found)
+ 		return false;
+ 
+-	if (!strcmp(relasec->name, ".rela__jump_table"))
+-		return should_keep_jump_label(lookup, relasec, offset, size,
+-					      jump_labels_found);
+-
+ 	return true;
+ }
+ 
+@@ -2488,7 +2552,6 @@ static void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
+ 	struct rela *rela, *safe;
+ 	char *src, *dest;
+ 	unsigned int group_size, src_offset, dest_offset;
+-	int jump_labels_found = 0;
+ 
+ 	LIST_HEAD(newrelas);
+ 
+@@ -2523,8 +2586,11 @@ static void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
+ 		if (src_offset + group_size > relasec->base->sh.sh_size)
+ 			group_size = (unsigned int)(relasec->base->sh.sh_size - src_offset);
+ 
+-		if (!should_keep_rela_group(lookup, relasec, src_offset, group_size,
+-					    &jump_labels_found))
++		if (!should_keep_rela_group(lookup, relasec, src_offset, group_size))
++			continue;
++
++		if (special->group_filter &&
++		    !special->group_filter(lookup, relasec, src_offset, group_size))
+ 			continue;
+ 
+ 		/*
+@@ -2557,9 +2623,13 @@ static void kpatch_regenerate_special_section(struct kpatch_elf *kelf,
+ 		dest_offset += group_size;
+ 	}
+ 
+-	if (jump_labels_found)
+-		ERROR("Found %d jump label(s) in the patched code. Jump labels aren't currently supported. Use static_key_enabled() instead.",
+-		      jump_labels_found);
++	if (jump_label_errors)
++		ERROR("Found %d unsupported jump label(s) in the patched code. Use static_key_enabled() instead.",
++		      jump_label_errors);
++
++	if (static_call_errors)
++		ERROR("Found %d unsupported static call(s) in the patched code. Use KPATCH_STATIC_CALL() instead.",
++		      static_call_errors);
+ 
+ 	if (!dest_offset) {
+ 		/* no changed or global functions referenced */
+diff --git a/kpatch-build/log.h b/kpatch-build/log.h
+index eefa0fce7b08..dbdc212713e1 100644
+--- a/kpatch-build/log.h
++++ b/kpatch-build/log.h
+@@ -9,7 +9,7 @@ extern enum loglevel loglevel;
+ extern char *childobj;
+ 
+ #define ERROR(format, ...) \
+-	err(EXIT_STATUS_ERROR, "ERROR: %s: %s: %d: " format, childobj, __FUNCTION__, __LINE__, ##__VA_ARGS__)
++	errx(EXIT_STATUS_ERROR, "ERROR: %s: %s: %d: " format, childobj, __FUNCTION__, __LINE__, ##__VA_ARGS__)
+ 
+ #define log_debug(format, ...) log(DEBUG, format, ##__VA_ARGS__)
+ #define log_normal(format, ...) log(NORMAL, "%s: " format, childobj, ##__VA_ARGS__)
+-- 
+2.38.1
+
